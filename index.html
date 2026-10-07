@@ -389,22 +389,28 @@ async function doSignOut(){
 
 async function doSignIn(){
   try{
-    // Get Teams UPN hint if available so redirect targets the right account
-    let hint = null;
     if(isInTeams()){
-      const ctx = await teamsInitSafe();
-      if(ctx) hint = ctx.user?.userPrincipalName || ctx.user?.loginHint || null;
-    }
-    const loginOpts = {
-      scopes: SCOPES,
-      prompt: 'select_account',  // Always show account picker — never silently use Sally
-    };
-    if(hint) loginOpts.loginHint = hint;
-
-    if(isInTeams()){
-      // Teams blocks popups — use redirect flow
-      await msalInstance.loginRedirect(loginOpts);
+      // Teams iframe: neither loginRedirect nor loginPopup work directly.
+      // Use the Teams SDK auth popup — Teams opens a controlled top-level window
+      // at our auth URL, MSAL completes the redirect there, then notifySuccess fires.
+      const authUrl = location.origin + location.pathname + '?teamsauth=1';
+      await new Promise((resolve, reject) => {
+        microsoftTeams.authentication.authenticate({
+          url: authUrl,
+          width: 600,
+          height: 535,
+          successCallback: (result) => {
+            // result contains the UPN passed back from the auth window
+            resolveIdentity(result).then(resolve).catch(reject);
+          },
+          failureCallback: (reason) => {
+            reject(new Error(reason || 'Teams auth failed'));
+          }
+        });
+      });
     } else {
+      // Browser: standard MSAL popup
+      const loginOpts = {scopes:SCOPES, prompt:'select_account'};
       const r = await msalInstance.loginPopup(loginOpts);
       graphToken = r.accessToken || await getToken();
       await resolveIdentity(r.account.username);
@@ -438,6 +444,28 @@ async function teamsInitSafe(){
 }
 
 async function boot(){
+  // ── Teams auth popup handler ──
+  // When Teams opens our page as an auth popup (teamsauth=1 param),
+  // complete the MSAL redirect and notify Teams of the result.
+  if(new URLSearchParams(location.search).get('teamsauth')==='1'){
+    try{
+      await msalInstance.initialize();
+      // Handle the redirect result from Microsoft login
+      const result = await msalInstance.handleRedirectPromise();
+      if(result && result.account){
+        await microsoftTeams.app.initialize();
+        microsoftTeams.authentication.notifySuccess(result.account.username);
+      } else {
+        // No result yet — this is the first load of the popup, trigger login
+        await msalInstance.loginRedirect({scopes:SCOPES, prompt:'select_account'});
+      }
+    }catch(e){
+      try{ await microsoftTeams.app.initialize(); }catch(_){}
+      microsoftTeams.authentication.notifyFailure(e.message||'auth_failed');
+    }
+    return; // Stop — this window is only for auth
+  }
+
   // Hard fallback: if boot takes more than 12s for any reason, show sign-in screen
   const hardTimeout = setTimeout(()=>{
     document.getElementById('loading-screen').style.display='none';
