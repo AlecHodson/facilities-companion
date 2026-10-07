@@ -994,7 +994,10 @@ async function renderDetail(id){
       <div class="step-body">
         <div class="step-name">${s.label}</div>
         <div class="step-meta">${a.decision==='pending'?(cls==='current'?'Awaiting decision':'Not yet reached'):(a.approverName+' — '+fmtDate(a.timestamp))}</div>
-        ${a.comment?`<div class="step-comment">"${esc(a.comment)}"</div>`:''}
+        ${a.comment?`<div class="step-comment" style="${a.decision==='rejected'?'background:var(--red-light);color:var(--red)':'background:var(--green-light);color:var(--green)'}">
+          <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;opacity:.8">${a.decision==='rejected'?'Rejection reason':'Justification'}</span><br>
+          ${esc(a.comment)}
+        </div>`:''}
       </div>
     </div>`;
   }).join('');
@@ -1005,13 +1008,23 @@ async function renderDetail(id){
     ${req.attachments.map(a=>`<div style="margin-bottom:8px"><a href="${a.url}" target="_blank">📎 ${esc(a.name)}</a></div>`).join('')}</div>`:'';
 
   const actionPanel=canApprove?`<div class="action-panel">
-    <h3>Your Approval Required</h3>
-    <p style="font-size:13px;color:var(--grey);margin-bottom:12px">Review the request details and approve or reject below.</p>
-    <label style="margin-bottom:6px;display:block">Comment <span style="color:var(--grey);font-weight:400">(required if rejecting)</span></label>
-    <textarea id="approvalComment" rows="3" placeholder="Optional comment..."></textarea>
+    <h3>Your Decision Required</h3>
+    <p style="font-size:13px;color:var(--grey);margin-bottom:14px">Review the full request details before deciding. Your justification is recorded against the approval chain and visible to all approvers.</p>
+    <label style="margin-bottom:6px;display:block;font-size:12.5px;font-weight:700">
+      Justification <span style="color:var(--red)">*</span>
+      <span style="color:var(--grey);font-weight:400;font-size:11px"> — required for both approval and rejection</span>
+    </label>
+    <textarea id="approvalComment" rows="4" placeholder="Explain your decision — e.g. approved as H&S priority confirmed, or rejected as quote required before proceeding..." oninput="document.getElementById('approvalCharCount').textContent=this.value.length+' chars'"></textarea>
+    <div style="font-size:11px;color:var(--grey);margin-bottom:14px;text-align:right" id="approvalCharCount">0 chars</div>
     <div class="action-btns">
-      <button class="btn btn-success" onclick="doApprove('${id}')">✓ Approve</button>
-      <button class="btn btn-danger" onclick="doReject('${id}')">✗ Reject</button>
+      <button class="btn btn-success" onclick="doApprove('${id}')">
+        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+        Approve
+      </button>
+      <button class="btn btn-danger" onclick="doReject('${id}')">
+        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        Reject
+      </button>
     </div>
   </div>`:'';
 
@@ -1060,12 +1073,13 @@ async function renderDetail(id){
 // ═══════════════════════════════════════════════════════════════
 async function doApprove(id){
   const comment=document.getElementById('approvalComment').value.trim();
+  if(!comment){showToast('Please add a justification before approving','error');return;}
   await processDecision(id,'approved',comment);
 }
 
 async function doReject(id){
   const comment=document.getElementById('approvalComment').value.trim();
-  if(!comment){showToast('A comment is required when rejecting','error');return;}
+  if(!comment){showToast('Please add a justification before rejecting','error');return;}
   await processDecision(id,'rejected',comment);
 }
 
