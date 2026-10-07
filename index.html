@@ -362,12 +362,23 @@ async function getToken(){
 
 async function doSignIn(){
   try{
+    // Get Teams UPN hint if available so redirect targets the right account
+    let hint = null;
     if(isInTeams()){
-      // Teams blocks popups — use redirect flow instead
-      await msalInstance.loginRedirect({scopes:SCOPES});
-      // loginRedirect navigates away; execution resumes in boot() via handleRedirectPromise()
+      const ctx = await teamsInitSafe();
+      if(ctx) hint = ctx.user?.userPrincipalName || ctx.user?.loginHint || null;
+    }
+    const loginOpts = {
+      scopes: SCOPES,
+      prompt: 'select_account',  // Always show account picker — never silently use Sally
+    };
+    if(hint) loginOpts.loginHint = hint;
+
+    if(isInTeams()){
+      // Teams blocks popups — use redirect flow
+      await msalInstance.loginRedirect(loginOpts);
     } else {
-      const r = await msalInstance.loginPopup({scopes:SCOPES});
+      const r = await msalInstance.loginPopup(loginOpts);
       graphToken = r.accessToken || await getToken();
       await resolveIdentity(r.account.username);
     }
@@ -490,8 +501,8 @@ async function resolveIdentity(upn){
     return;
   }
 
-  // Unknown — default to read-only viewer
-  SESSION = {name:upn, email:upn, role:'viewer', zone:'all', canSeeAll:true, isRequester:false, nurseryEntry:null};
+  // Unknown M365 user — treat as requester (can raise requests, sees own only)
+  SESSION = {name:upn, email:upn, role:'requester', zone:'all', canSeeAll:false, isRequester:true, nurseryEntry:null};
   showApp();
 }
 
@@ -619,11 +630,24 @@ async function renderDashboard(){
   let recentTable='';
   const recent=visible.slice(0,10);
   if(recent.length) recentTable=`<h3 style="font-size:15px;font-weight:700;color:var(--teal);margin-bottom:12px">Recent Requests</h3>${requestTable(recent)}`;
-  else recentTable=`<div class="empty"><svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/></svg><p>No requests yet${SESSION.isRequester?' — click New Request to raise one':''}</p></div>`;
+  else recentTable=`<div class="empty"><svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/></svg><p>No requests yet${SESSION.isRequester?' — use the button above to raise one':''}</p></div>`;
+
+  // Hero CTA card for requesters
+  const heroCta = SESSION.isRequester ? \`
+  <div onclick="navigate('new')" style="cursor:pointer;background:var(--teal);color:#fff;border-radius:var(--radius);padding:24px 28px;margin-bottom:24px;display:flex;align-items:center;gap:20px;box-shadow:var(--shadow);transition:opacity .15s;" onmouseover="this.style.opacity='.9'" onmouseout="this.style.opacity='1'">
+    <div style="width:52px;height:52px;background:rgba(255,255,255,.2);border-radius:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0">
+      <svg width="26" height="26" fill="none" stroke="#fff" stroke-width="2.2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+    </div>
+    <div style="flex:1">
+      <div style="font-size:18px;font-weight:700;margin-bottom:4px">Raise a Facilities Request</div>
+      <div style="font-size:13px;opacity:.85">Submit a project request for approval — decorating, flooring, building work, tech, heating and more. Requests over £500 or 5 days labour require approval before a PO code is issued.</div>
+    </div>
+    <svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2.5" viewBox="0 0 24 24" style="flex-shrink:0;opacity:.8"><polyline points="9 18 15 12 9 6"/></svg>
+  </div>\` : '';
 
   main.innerHTML=`<div class="page-header"><div><div class="page-title">Dashboard</div><div class="page-sub">Welcome back, ${SESSION.name}</div></div>
   ${SESSION.isRequester?'<button class="btn btn-primary" onclick="navigate(\'new\')"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New Request</button>':''}
-  </div>${statsHtml}${pendingTable}${recentTable}`;
+  </div>${heroCta}${statsHtml}${pendingTable}${recentTable}`;
 }
 
 function isMyTurn(req){
