@@ -362,9 +362,15 @@ async function getToken(){
 
 async function doSignIn(){
   try{
-    const r = await msalInstance.loginPopup({scopes:SCOPES});
-    graphToken = r.accessToken || await getToken();
-    await resolveIdentity(r.account.username);
+    if(isInTeams()){
+      // Teams blocks popups — use redirect flow instead
+      await msalInstance.loginRedirect({scopes:SCOPES});
+      // loginRedirect navigates away; execution resumes in boot() via handleRedirectPromise()
+    } else {
+      const r = await msalInstance.loginPopup({scopes:SCOPES});
+      graphToken = r.accessToken || await getToken();
+      await resolveIdentity(r.account.username);
+    }
   }catch(e){showToast('Sign-in failed: '+e.message,'error');}
 }
 
@@ -410,8 +416,16 @@ async function boot(){
     await msalInstance.initialize();
   }catch(e){showSignIn();return;}
 
-  // Handle redirect (e.g. after loginRedirect)
-  try{await msalInstance.handleRedirectPromise();}catch(e){}
+  // Handle redirect (e.g. after loginRedirect in Teams)
+  try{
+    const redirectResult = await msalInstance.handleRedirectPromise();
+    if(redirectResult && redirectResult.account){
+      graphToken = redirectResult.accessToken;
+      clearTimeout(hardTimeout);
+      await resolveIdentity(redirectResult.account.username);
+      return;
+    }
+  }catch(e){}
 
   let hint = null;
 
