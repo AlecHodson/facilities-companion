@@ -372,12 +372,19 @@ async function doSignIn(){
 // TEAMS + AUTO SIGN-IN
 // ═══════════════════════════════════════════════════════════════
 function isInTeams(){
-  try{return window.self!==window.top || navigator.userAgent.includes('Teams');}catch(e){return true;}
+  try{
+    // Only treat as Teams if the Teams JS SDK is present AND we are in an iframe
+    // (window.self!==window.top alone is too broad - matches any iframe embed)
+    const inIframe = window.self !== window.top;
+    const hasTeamsUA = navigator.userAgent.includes('Teams');
+    const hasTeamsSDK = typeof microsoftTeams !== 'undefined';
+    return (inIframe && hasTeamsSDK) || hasTeamsUA;
+  }catch(e){return false;}
 }
 
 async function teamsInitSafe(){
   return new Promise(res=>{
-    const t=setTimeout(()=>res(null),8000);
+    const t=setTimeout(()=>res(null),3000);
     try{
       microsoftTeams.app.initialize().then(()=>{
         microsoftTeams.app.getContext().then(ctx=>{clearTimeout(t);res(ctx);}).catch(()=>{clearTimeout(t);res(null);});
@@ -387,41 +394,61 @@ async function teamsInitSafe(){
 }
 
 async function boot(){
-  await msalInstance.initialize();
+  // Hard fallback: if boot takes more than 12s for any reason, show sign-in screen
+  const hardTimeout = setTimeout(()=>{
+    document.getElementById('loading-screen').style.display='none';
+    document.getElementById('auth-screen').style.display='flex';
+  }, 12000);
 
-  // Handle redirect
+  function showSignIn(){
+    clearTimeout(hardTimeout);
+    document.getElementById('loading-screen').style.display='none';
+    document.getElementById('auth-screen').style.display='flex';
+  }
+
+  try{
+    await msalInstance.initialize();
+  }catch(e){showSignIn();return;}
+
+  // Handle redirect (e.g. after loginRedirect)
   try{await msalInstance.handleRedirectPromise();}catch(e){}
 
   let hint = null;
 
+  // Only attempt Teams SDK if we are genuinely in a Teams frame
   if(isInTeams()){
     const ctx = await teamsInitSafe();
     if(ctx) hint = ctx.user?.userPrincipalName || ctx.user?.loginHint || null;
   }
 
-  // Try silent auth
+  // 1. Try silent token for any cached MSAL account
   try{
     const accounts = msalInstance.getAllAccounts();
-    const acct = hint ? accounts.find(a=>a.username.toLowerCase()===hint.toLowerCase()) : accounts[0];
+    const acct = hint
+      ? accounts.find(a=>a.username.toLowerCase()===hint.toLowerCase())
+      : accounts[0];
     if(acct){
       const r = await msalInstance.acquireTokenSilent({scopes:SCOPES,account:acct});
       graphToken = r.accessToken;
+      clearTimeout(hardTimeout);
       await resolveIdentity(acct.username);
       return;
     }
   }catch(e){}
 
-  // Try ssoSilent
+  // 2. Try ssoSilent against the browser's live M365 session
   try{
-    const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint:hint||undefined});
+    const ssoOpts = {scopes:SCOPES};
+    if(hint) ssoOpts.loginHint = hint;
+    const r = await msalInstance.ssoSilent(ssoOpts);
     graphToken = r.accessToken;
+    clearTimeout(hardTimeout);
     await resolveIdentity(r.account.username);
     return;
   }catch(e){}
 
-  // Show auth screen
-  document.getElementById('loading-screen').style.display='none';
-  document.getElementById('auth-screen').style.display='flex';
+  // All silent paths failed — show the sign-in button
+  showSignIn();
 }
 
 async function resolveIdentity(upn){
