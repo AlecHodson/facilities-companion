@@ -350,8 +350,22 @@ let currentRequestId = null;
 // MSAL
 // ═══════════════════════════════════════════════════════════════
 const msalConfig = {
-  auth:{clientId:CLIENT_ID, authority:`https://login.microsoftonline.com/${TENANT_ID}`, redirectUri:location.origin+location.pathname},
-  cache:{cacheLocation:'sessionStorage', storeAuthStateInCookie:false},
+  auth:{
+    clientId:CLIENT_ID,
+    authority:`https://login.microsoftonline.com/${TENANT_ID}`,
+    redirectUri:location.origin+location.pathname,
+    navigateToLoginRequestUrl:false,
+  },
+  cache:{
+    cacheLocation:'localStorage',  // Use localStorage not sessionStorage to avoid cross-window state bleed
+    storeAuthStateInCookie:true,   // Cookie fallback for Safari/Teams webview
+  },
+  system:{
+    allowNativeBroker:false,       // Disable native broker to prevent popup detection issues
+    windowHashTimeout:9000,
+    iframeHashTimeout:9000,
+    loadFrameTimeout:9000,
+  }
 };
 const msalInstance = new msal.PublicClientApplication(msalConfig);
 const SCOPES = ['User.Read','Files.ReadWrite.All','Sites.ReadWrite.All','Mail.Send'];
@@ -484,6 +498,19 @@ async function boot(){
     document.getElementById('loading-screen').style.display='none';
     document.getElementById('auth-screen').style.display='flex';
   }
+
+  // Clear any stale MSAL popup/interaction state left by a previous auth popup.
+  // This prevents block_nested_popups on the main page after a Teams auth session.
+  try{
+    const keysToRemove = [];
+    for(let i=0;i<sessionStorage.length;i++){
+      const k=sessionStorage.key(i);
+      if(k && (k.includes('interaction.status')||k.includes('popup')||k.includes('request.origin'))){
+        keysToRemove.push(k);
+      }
+    }
+    keysToRemove.forEach(k=>sessionStorage.removeItem(k));
+  }catch(_){}
 
   try{
     await msalInstance.initialize();
