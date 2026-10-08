@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Facilities Companion — Auth</title>
+<script src="https://alcdn.msauth.net/browser/2.37.1/js/msal-browser.min.js"></script>
+</head>
+<body>
+<script>
+// This page is the MSAL redirect URI for Facilities Companion.
+// It handles the post-login redirect from Microsoft, extracts the token,
+// and redirects back to the main app page.
+(async function(){
+  try{
+    const msalInstance = new msal.PublicClientApplication({
+      auth:{
+        clientId:'c1c5c9f6-f764-4c66-b5ed-c5ac385f669a',
+        authority:'https://login.microsoftonline.com/c498c1f7-99ac-42e6-bd6f-e819bf40f167',
+        redirectUri:'https://alechodson.github.io/facilities-companion/auth.html',
+        navigateToLoginRequestUrl:false,
+      },
+      cache:{ cacheLocation:'localStorage', storeAuthStateInCookie:true },
+    });
+    await msalInstance.initialize();
+    await msalInstance.handleRedirectPromise();
+    // Redirect back to main app — MSAL has now cached the account in localStorage
+    window.location.replace('https://alechodson.github.io/facilities-companion/');
+  }catch(e){
+    console.error('Auth callback error:', e);
+    window.location.replace('https://alechodson.github.io/facilities-companion/');
+  }
+})();
+</script>
+</body>
+</html>
