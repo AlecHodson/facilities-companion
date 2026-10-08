@@ -339,28 +339,25 @@ const STATUS_BADGE = {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// SESSION
+// AUTH — clean implementation, no loginRedirect, no loops
 // ═══════════════════════════════════════════════════════════════
-let SESSION = null; // {name, email, role, zone, canSeeAll, nurseryEntry, isRequester}
-let graphToken = null;
-let currentView = 'dashboard';
-let currentRequestId = null;
+var SESSION = null;
+var graphToken = null;
+var tokenExpiry = 0;
 
-// ═══════════════════════════════════════════════════════════════
-// MSAL
-// ═══════════════════════════════════════════════════════════════
+// MSAL config — redirectUri is the main page itself (handles its own redirect result)
 const MSAL_CONFIG = {
   auth:{
     clientId: CLIENT_ID,
     authority: `https://login.microsoftonline.com/${TENANT_ID}`,
-    redirectUri: 'https://alechodson.github.io/facilities-companion/auth.html',
+    redirectUri: 'https://alechodson.github.io/facilities-companion/',
     navigateToLoginRequestUrl: false,
   },
   cache:{ cacheLocation:'localStorage', storeAuthStateInCookie:true },
 };
 const SCOPES = ['User.Read','Files.ReadWrite.All','Sites.ReadWrite.All','Mail.Send'];
 
-// Initialise MSAL with retry — mirrors Issue Companion pattern exactly
+// Initialise MSAL with retry loop — never blocks startup
 var msalInstance = null;
 (function tryInitMSAL(){
   if(typeof msal === 'undefined' || !msal.PublicClientApplication){
@@ -369,6 +366,8 @@ var msalInstance = null;
   try{
     msalInstance = new msal.PublicClientApplication(MSAL_CONFIG);
     msalInstance.initialize().then(async function(){
+      // Handle any pending redirect result (e.g. returning from Microsoft login page)
+      // This is the ONLY place loginRedirect results are processed
       try{
         const redir = await msalInstance.handleRedirectPromise();
         if(redir && redir.account){
@@ -381,11 +380,24 @@ var msalInstance = null;
   }catch(e){ console.error('[MSAL] Init failed:', e); }
 })();
 
+function isInTeams(){
+  try{ return window.parent !== window || window.self !== window.top; }
+  catch(e){ return true; }
+}
+
+function teamsInitSafe(){
+  return Promise.race([
+    microsoftTeams.app.initialize(),
+    new Promise(function(_,reject){
+      setTimeout(function(){ reject(new Error('Teams init timeout')); }, 3000);
+    })
+  ]);
+}
+
 async function getToken(){
   if(graphToken && Date.now() < tokenExpiry - 60000) return graphToken;
   if(!msalInstance) return null;
-  const loginHint = SESSION && SESSION.email ? SESSION.email : undefined;
-  // 1. Cached account
+  const hint = SESSION && SESSION.email ? SESSION.email : undefined;
   const accounts = msalInstance.getAllAccounts();
   if(accounts.length){
     try{
@@ -395,10 +407,9 @@ async function getToken(){
       return graphToken;
     }catch(e){}
   }
-  // 2. ssoSilent
-  if(loginHint){
+  if(hint){
     try{
-      const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint});
+      const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint:hint});
       graphToken = r.accessToken;
       tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
       return graphToken;
@@ -407,42 +418,14 @@ async function getToken(){
   return null;
 }
 
-async function doSignOut(){
-  // Clear app state immediately
-  SESSION = null;
-  graphToken = null;
-  tokenExpiry = 0;
-  try{ localStorage.removeItem('fcSession'); }catch(e){}
-  document.getElementById('app').style.display='none';
-  document.getElementById('signOutBtn').style.display='none';
-  document.getElementById('auth-screen').style.display='flex';
-  document.getElementById('signInBtn').textContent='Sign in with Microsoft';
-  // Clear MSAL cache
-  try{
-    if(msalInstance){
-      const accounts = msalInstance.getAllAccounts();
-      if(accounts.length && !isInTeams()){
-        // Browser: use logoutRedirect to fully clear Microsoft session
-        await msalInstance.logoutRedirect({
-          account: accounts[0],
-          postLogoutRedirectUri: 'https://alechodson.github.io/facilities-companion/'
-        });
-        return; // page will redirect
-      }
-      // Teams or no accounts: just clear the cache locally
-      msalInstance.clearCache();
-    }
-  }catch(e){ console.warn('[SIGNOUT]', e.message); }
-}
-
+// Sign-in button handler — popup only, never redirect (no loops possible)
 async function doSignIn(){
   const btn = document.getElementById('signInBtn');
   if(btn){ btn.disabled=true; btn.textContent='Signing in...'; }
   try{
     if(!msalInstance) throw new Error('Auth not ready — please wait a moment and try again.');
-    const loginHint = SESSION && SESSION.email ? SESSION.email : undefined;
 
-    // 1. Try silent with cached account
+    // 1. Silent — cached account
     const accounts = msalInstance.getAllAccounts();
     if(accounts.length){
       try{
@@ -454,42 +437,39 @@ async function doSignIn(){
       }catch(e){}
     }
 
-    // 2. Try ssoSilent (works when M365 session exists in browser)
-    if(loginHint){
-      try{
-        const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint});
-        graphToken = r.accessToken;
-        tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
-        await resolveIdentity(r.account.username);
-        return;
-      }catch(e){}
-    }
+    // 2. ssoSilent — live M365 browser session
+    try{
+      const r = await msalInstance.ssoSilent({scopes:SCOPES});
+      graphToken = r.accessToken;
+      tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
+      await resolveIdentity(r.account.username);
+      return;
+    }catch(e){}
 
-    // 3. In Teams — get UPN from Teams context and match identity (no popup/redirect)
-    if(isInTeams()){
+    // 3. In Teams — get UPN from context, no popup or redirect
+    if(isInTeams() && typeof microsoftTeams !== 'undefined'){
       try{
         await teamsInitSafe();
         const ctx = await microsoftTeams.app.getContext();
-        const teamsHint = ctx.user && (ctx.user.userPrincipalName || ctx.user.loginHint);
-        if(teamsHint){
-          // Try ssoSilent with Teams UPN
+        const upn = ctx.user && (ctx.user.userPrincipalName || ctx.user.loginHint);
+        if(upn){
+          // Try ssoSilent with the Teams UPN
           try{
-            const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint:teamsHint});
+            const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint:upn});
             graphToken = r.accessToken;
             tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
-          }catch(e){ console.warn('[AUTH] Teams ssoSilent failed (expected):', e.message); }
-          // Whether or not we got a token, resolve identity from the Teams UPN
-          await resolveIdentity(teamsHint);
+          }catch(e){ console.warn('[AUTH] Teams ssoSilent failed:', e.message); }
+          await resolveIdentity(upn);
           return;
         }
       }catch(e){ console.warn('[AUTH] Teams context failed:', e.message); }
-      showToast('Could not detect your Teams identity. Please sign in via browser.','error');
-      return;
     }
 
-    // 4. Browser fallback — loginRedirect to dedicated auth.html
-    await msalInstance.loginRedirect({scopes:SCOPES, prompt:'select_account'});
-    // Execution stops here — resumes in the MSAL IIFE via handleRedirectPromise on return
+    // 4. Browser popup — last resort, only reached if no cached session exists
+    const r = await msalInstance.loginPopup({scopes:SCOPES, prompt:'select_account'});
+    graphToken = r.accessToken;
+    tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
+    await resolveIdentity(r.account.username);
 
   }catch(e){
     showToast('Sign-in failed: '+e.message,'error');
@@ -498,55 +478,55 @@ async function doSignIn(){
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// TEAMS + AUTO SIGN-IN
-// ═══════════════════════════════════════════════════════════════
-function isInTeams(){
-  try{ return window.parent !== window || window.self !== window.top; }
-  catch(e){ return true; }
+async function doSignOut(){
+  SESSION = null;
+  graphToken = null;
+  tokenExpiry = 0;
+  try{ localStorage.removeItem('fcSession'); }catch(e){}
+  // Clear MSAL cache — no redirect, just wipe locally
+  try{ if(msalInstance) msalInstance.clearCache(); }catch(e){}
+  // Reset UI
+  document.getElementById('app').style.display='none';
+  document.getElementById('signOutBtn').style.display='none';
+  document.getElementById('auth-screen').style.display='flex';
+  const btn = document.getElementById('signInBtn');
+  if(btn){ btn.disabled=false; btn.textContent='Sign in with Microsoft'; }
 }
 
-function teamsInitSafe(){
-  return Promise.race([
-    microsoftTeams.app.initialize(),
-    new Promise(function(_,reject){ setTimeout(function(){ reject(new Error('Teams init timeout')); }, 3000); })
-  ]);
-}
-
-// ── Startup sequence — mirrors Issue Companion pattern ──
+// ── Startup sequence ──────────────────────────────────────────
 (async function startup(){
-  const hardTimeout = setTimeout(()=>{
+  const hardTimeout = setTimeout(function(){
     document.getElementById('loading-screen').style.display='none';
     document.getElementById('auth-screen').style.display='flex';
   }, 12000);
 
-  // Wait for MSAL to initialise (retry IIFE above handles it)
+  // Wait for MSAL to initialise (up to 5s)
   let waited = 0;
-  while(!msalInstance && waited < 5000){ await new Promise(r=>setTimeout(r,100)); waited+=100; }
+  while(!msalInstance && waited < 5000){
+    await new Promise(function(r){ setTimeout(r, 100); });
+    waited += 100;
+  }
 
-  // 1. Try Teams auto sign-in
-  if(isInTeams() && typeof microsoftTeams !== 'undefined'){
+  // 1. Teams auto sign-in — UPN from Teams context, no popup needed
+  if(typeof microsoftTeams !== 'undefined' && isInTeams()){
     try{
       await teamsInitSafe();
       const ctx = await microsoftTeams.app.getContext();
-      const hint = ctx.user && (ctx.user.userPrincipalName || ctx.user.loginHint);
-      if(hint){
-        // Try token silently
+      const upn = ctx.user && (ctx.user.userPrincipalName || ctx.user.loginHint);
+      if(upn){
         try{
-          const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint:hint});
+          const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint:upn});
           graphToken = r.accessToken;
           tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
-          console.log('[STARTUP] Teams ssoSilent succeeded');
-        }catch(e){ console.warn('[STARTUP] Teams ssoSilent failed (expected):', e.message); }
-        // Resolve identity from Teams UPN regardless of token
+        }catch(e){ console.warn('[STARTUP] Teams ssoSilent failed:', e.message); }
         clearTimeout(hardTimeout);
-        await resolveIdentity(hint);
+        await resolveIdentity(upn);
         return;
       }
     }catch(e){ console.warn('[STARTUP] Teams context failed:', e.message); }
   }
 
-  // 2. Try cached MSAL account (browser)
+  // 2. Browser — cached MSAL account
   if(msalInstance){
     const accounts = msalInstance.getAllAccounts();
     if(accounts.length){
@@ -560,7 +540,7 @@ function teamsInitSafe(){
       }catch(e){}
     }
 
-    // 3. Try browser ssoSilent (works if signed into M365 in this browser)
+    // 3. Browser ssoSilent — works if already signed into M365 in this browser
     try{
       const r = await msalInstance.ssoSilent({scopes:SCOPES});
       graphToken = r.accessToken;
@@ -571,11 +551,8 @@ function teamsInitSafe(){
     }catch(e){ console.warn('[STARTUP] Browser ssoSilent failed:', e.message); }
   }
 
-  // 4. Nothing worked — show sign-in screen
+  // 4. Nothing worked — show sign-in button
   clearTimeout(hardTimeout);
   document.getElementById('loading-screen').style.display='none';
   document.getElementById('auth-screen').style.display='flex';
 })();
-</script>
-</body>
-</html>
