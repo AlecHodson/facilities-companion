@@ -349,943 +349,233 @@ let currentRequestId = null;
 // ═══════════════════════════════════════════════════════════════
 // MSAL
 // ═══════════════════════════════════════════════════════════════
-const msalConfig = {
+const MSAL_CONFIG = {
   auth:{
-    clientId:CLIENT_ID,
-    authority:`https://login.microsoftonline.com/${TENANT_ID}`,
-    redirectUri:location.origin+location.pathname,
-    navigateToLoginRequestUrl:false,
+    clientId: CLIENT_ID,
+    authority: `https://login.microsoftonline.com/${TENANT_ID}`,
+    redirectUri: 'https://alechodson.github.io/facilities-companion/auth.html',
+    navigateToLoginRequestUrl: false,
   },
-  cache:{
-    cacheLocation:'localStorage',  // Use localStorage not sessionStorage to avoid cross-window state bleed
-    storeAuthStateInCookie:true,   // Cookie fallback for Safari/Teams webview
-  },
-  system:{
-    allowNativeBroker:false,       // Disable native broker to prevent popup detection issues
-    windowHashTimeout:9000,
-    iframeHashTimeout:9000,
-    loadFrameTimeout:9000,
-  }
+  cache:{ cacheLocation:'localStorage', storeAuthStateInCookie:true },
 };
-const msalInstance = new msal.PublicClientApplication(msalConfig);
 const SCOPES = ['User.Read','Files.ReadWrite.All','Sites.ReadWrite.All','Mail.Send'];
 
+// Initialise MSAL with retry — mirrors Issue Companion pattern exactly
+var msalInstance = null;
+(function tryInitMSAL(){
+  if(typeof msal === 'undefined' || !msal.PublicClientApplication){
+    setTimeout(tryInitMSAL, 100); return;
+  }
+  try{
+    msalInstance = new msal.PublicClientApplication(MSAL_CONFIG);
+    msalInstance.initialize().then(async function(){
+      try{
+        const redir = await msalInstance.handleRedirectPromise();
+        if(redir && redir.account){
+          graphToken = redir.accessToken;
+          tokenExpiry = redir.expiresOn ? redir.expiresOn.getTime() : Date.now()+3600000;
+          await resolveIdentity(redir.account.username);
+        }
+      }catch(e){ console.warn('[MSAL] Redirect handle:', e.message); }
+    }).catch(function(e){ console.error('[MSAL] Init failed:', e); });
+  }catch(e){ console.error('[MSAL] Init failed:', e); }
+})();
+
 async function getToken(){
+  if(graphToken && Date.now() < tokenExpiry - 60000) return graphToken;
+  if(!msalInstance) return null;
+  const loginHint = SESSION && SESSION.email ? SESSION.email : undefined;
+  // 1. Cached account
   const accounts = msalInstance.getAllAccounts();
   if(accounts.length){
     try{
-      const r = await msalInstance.acquireTokenSilent({scopes:SCOPES,account:accounts[0]});
-      return r.accessToken;
+      const r = await msalInstance.acquireTokenSilent({scopes:SCOPES, account:accounts[0]});
+      graphToken = r.accessToken;
+      tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
+      return graphToken;
     }catch(e){}
   }
-  const r = await msalInstance.acquireTokenPopup({scopes:SCOPES});
-  return r.accessToken;
+  // 2. ssoSilent
+  if(loginHint){
+    try{
+      const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint});
+      graphToken = r.accessToken;
+      tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
+      return graphToken;
+    }catch(e){}
+  }
+  return null;
 }
 
 async function doSignOut(){
-  try{
-    // Clear all MSAL cached accounts and return to sign-in screen
-    const accounts = msalInstance.getAllAccounts();
-    if(accounts.length){
-      await msalInstance.logoutPopup({account:accounts[0], mainWindowRedirectUri: location.href});
-    }
-  }catch(e){
-    // If popup fails (e.g. in Teams), clear cache manually and reset UI
-    msalInstance.clearCache();
-  }
-  // Reset app state
+  // Clear app state immediately
   SESSION = null;
   graphToken = null;
+  tokenExpiry = 0;
+  try{ localStorage.removeItem('fcSession'); }catch(e){}
   document.getElementById('app').style.display='none';
   document.getElementById('signOutBtn').style.display='none';
   document.getElementById('auth-screen').style.display='flex';
+  document.getElementById('signInBtn').textContent='Sign in with Microsoft';
+  // Clear MSAL cache
+  try{
+    if(msalInstance){
+      const accounts = msalInstance.getAllAccounts();
+      if(accounts.length && !isInTeams()){
+        // Browser: use logoutRedirect to fully clear Microsoft session
+        await msalInstance.logoutRedirect({
+          account: accounts[0],
+          postLogoutRedirectUri: 'https://alechodson.github.io/facilities-companion/'
+        });
+        return; // page will redirect
+      }
+      // Teams or no accounts: just clear the cache locally
+      msalInstance.clearCache();
+    }
+  }catch(e){ console.warn('[SIGNOUT]', e.message); }
 }
 
 async function doSignIn(){
+  const btn = document.getElementById('signInBtn');
+  if(btn){ btn.disabled=true; btn.textContent='Signing in...'; }
   try{
-    if(isInTeams()){
-      // Teams SDK v2: use authentication.authenticate() with Promise API (not callbacks)
-      const authUrl = location.origin + location.pathname + '?teamsauth=1';
-      const upn = await microsoftTeams.authentication.authenticate({
-        url: authUrl,
-        width: 600,
-        height: 535,
-      });
-      // upn is the value passed to notifySuccess() in the popup
-      if(upn){
-        // Get token silently now we know who the user is
-        try{
-          const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint:upn});
-          graphToken = r.accessToken;
-        }catch(e){
-          // ssoSilent failed — try acquireTokenSilent with cached account
-          const accounts = msalInstance.getAllAccounts();
-          const acct = accounts.find(a=>a.username.toLowerCase()===upn.toLowerCase());
-          if(acct){
-            const r = await msalInstance.acquireTokenSilent({scopes:SCOPES,account:acct});
-            graphToken = r.accessToken;
-          }
-        }
-        await resolveIdentity(upn);
-      }
-    } else {
-      // Browser: standard MSAL popup
-      const loginOpts = {scopes:SCOPES, prompt:'select_account'};
-      const r = await msalInstance.loginPopup(loginOpts);
-      graphToken = r.accessToken || await getToken();
-      await resolveIdentity(r.account.username);
+    if(!msalInstance) throw new Error('Auth not ready — please wait a moment and try again.');
+    const loginHint = SESSION && SESSION.email ? SESSION.email : undefined;
+
+    // 1. Try silent with cached account
+    const accounts = msalInstance.getAllAccounts();
+    if(accounts.length){
+      try{
+        const r = await msalInstance.acquireTokenSilent({scopes:SCOPES, account:accounts[0]});
+        graphToken = r.accessToken;
+        tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
+        await resolveIdentity(accounts[0].username);
+        return;
+      }catch(e){}
     }
-  }catch(e){showToast('Sign-in failed: '+e.message,'error');}
+
+    // 2. Try ssoSilent (works when M365 session exists in browser)
+    if(loginHint){
+      try{
+        const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint});
+        graphToken = r.accessToken;
+        tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
+        await resolveIdentity(r.account.username);
+        return;
+      }catch(e){}
+    }
+
+    // 3. In Teams — get UPN from Teams context and match identity (no popup/redirect)
+    if(isInTeams()){
+      try{
+        await teamsInitSafe();
+        const ctx = await microsoftTeams.app.getContext();
+        const teamsHint = ctx.user && (ctx.user.userPrincipalName || ctx.user.loginHint);
+        if(teamsHint){
+          // Try ssoSilent with Teams UPN
+          try{
+            const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint:teamsHint});
+            graphToken = r.accessToken;
+            tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
+          }catch(e){ console.warn('[AUTH] Teams ssoSilent failed (expected):', e.message); }
+          // Whether or not we got a token, resolve identity from the Teams UPN
+          await resolveIdentity(teamsHint);
+          return;
+        }
+      }catch(e){ console.warn('[AUTH] Teams context failed:', e.message); }
+      showToast('Could not detect your Teams identity. Please sign in via browser.','error');
+      return;
+    }
+
+    // 4. Browser fallback — loginRedirect to dedicated auth.html
+    await msalInstance.loginRedirect({scopes:SCOPES, prompt:'select_account'});
+    // Execution stops here — resumes in the MSAL IIFE via handleRedirectPromise on return
+
+  }catch(e){
+    showToast('Sign-in failed: '+e.message,'error');
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent='Sign in with Microsoft'; }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
 // TEAMS + AUTO SIGN-IN
 // ═══════════════════════════════════════════════════════════════
 function isInTeams(){
-  try{
-    // Only treat as Teams if the Teams JS SDK is present AND we are in an iframe
-    // (window.self!==window.top alone is too broad - matches any iframe embed)
-    const inIframe = window.self !== window.top;
-    const hasTeamsUA = navigator.userAgent.includes('Teams');
-    const hasTeamsSDK = typeof microsoftTeams !== 'undefined';
-    return (inIframe && hasTeamsSDK) || hasTeamsUA;
-  }catch(e){return false;}
+  try{ return window.parent !== window || window.self !== window.top; }
+  catch(e){ return true; }
 }
 
-async function teamsInitSafe(){
-  return new Promise(res=>{
-    const t=setTimeout(()=>res(null),3000);
-    try{
-      microsoftTeams.app.initialize().then(()=>{
-        microsoftTeams.app.getContext().then(ctx=>{clearTimeout(t);res(ctx);}).catch(()=>{clearTimeout(t);res(null);});
-      }).catch(()=>{clearTimeout(t);res(null);});
-    }catch(e){clearTimeout(t);res(null);}
-  });
+function teamsInitSafe(){
+  return Promise.race([
+    microsoftTeams.app.initialize(),
+    new Promise(function(_,reject){ setTimeout(function(){ reject(new Error('Teams init timeout')); }, 3000); })
+  ]);
 }
 
-async function boot(){
-  // ── Teams auth popup handler ──
-  // Teams SDK v2 opens this page as a top-level popup window with ?teamsauth=1.
-  // MSAL loginRedirect works here (top frame, not iframe).
-  if(new URLSearchParams(location.search).get('teamsauth')==='1'){
-    try{
-      await msalInstance.initialize();
-      // Check if we're returning from a Microsoft redirect
-      const result = await msalInstance.handleRedirectPromise();
-      if(result && result.account){
-        // Auth complete — notify the Teams tab with the UPN
-        // SDK v2: notifySuccess is on microsoftTeams.authentication
-        microsoftTeams.authentication.notifySuccess(result.account.username);
-      } else {
-        // First load of popup — kick off the Microsoft login redirect
-        // This window is a top frame so loginRedirect works fine
-        await msalInstance.loginRedirect({scopes:SCOPES, prompt:'select_account'});
-      }
-    }catch(e){
-      microsoftTeams.authentication.notifyFailure(e.message||'auth_failed');
-    }
-    return; // This window is auth-only — stop here
-  }
-
-  // Hard fallback: if boot takes more than 12s for any reason, show sign-in screen
+// ── Startup sequence — mirrors Issue Companion pattern ──
+(async function startup(){
   const hardTimeout = setTimeout(()=>{
     document.getElementById('loading-screen').style.display='none';
     document.getElementById('auth-screen').style.display='flex';
   }, 12000);
 
-  function showSignIn(){
-    clearTimeout(hardTimeout);
-    document.getElementById('loading-screen').style.display='none';
-    document.getElementById('auth-screen').style.display='flex';
-  }
+  // Wait for MSAL to initialise (retry IIFE above handles it)
+  let waited = 0;
+  while(!msalInstance && waited < 5000){ await new Promise(r=>setTimeout(r,100)); waited+=100; }
 
-  // Clear any stale MSAL popup/interaction state left by a previous auth popup.
-  // This prevents block_nested_popups on the main page after a Teams auth session.
-  try{
-    const keysToRemove = [];
-    for(let i=0;i<sessionStorage.length;i++){
-      const k=sessionStorage.key(i);
-      if(k && (k.includes('interaction.status')||k.includes('popup')||k.includes('request.origin'))){
-        keysToRemove.push(k);
+  // 1. Try Teams auto sign-in
+  if(isInTeams() && typeof microsoftTeams !== 'undefined'){
+    try{
+      await teamsInitSafe();
+      const ctx = await microsoftTeams.app.getContext();
+      const hint = ctx.user && (ctx.user.userPrincipalName || ctx.user.loginHint);
+      if(hint){
+        // Try token silently
+        try{
+          const r = await msalInstance.ssoSilent({scopes:SCOPES, loginHint:hint});
+          graphToken = r.accessToken;
+          tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
+          console.log('[STARTUP] Teams ssoSilent succeeded');
+        }catch(e){ console.warn('[STARTUP] Teams ssoSilent failed (expected):', e.message); }
+        // Resolve identity from Teams UPN regardless of token
+        clearTimeout(hardTimeout);
+        await resolveIdentity(hint);
+        return;
       }
-    }
-    keysToRemove.forEach(k=>sessionStorage.removeItem(k));
-  }catch(_){}
-
-  try{
-    await msalInstance.initialize();
-  }catch(e){showSignIn();return;}
-
-  // Handle redirect (e.g. after loginRedirect in Teams)
-  try{
-    const redirectResult = await msalInstance.handleRedirectPromise();
-    if(redirectResult && redirectResult.account){
-      graphToken = redirectResult.accessToken;
-      clearTimeout(hardTimeout);
-      await resolveIdentity(redirectResult.account.username);
-      return;
-    }
-  }catch(e){}
-
-  let hint = null;
-
-  // Only attempt Teams SDK if we are genuinely in a Teams frame
-  if(isInTeams()){
-    const ctx = await teamsInitSafe();
-    if(ctx) hint = ctx.user?.userPrincipalName || ctx.user?.loginHint || null;
+    }catch(e){ console.warn('[STARTUP] Teams context failed:', e.message); }
   }
 
-  // 1. Try silent token — ONLY use cached account if we have a Teams UPN hint
-  // (prevents Sally's service account being silently used in browser)
-  try{
+  // 2. Try cached MSAL account (browser)
+  if(msalInstance){
     const accounts = msalInstance.getAllAccounts();
-    const acct = hint
-      ? accounts.find(a=>a.username.toLowerCase()===hint.toLowerCase())
-      : null; // no hint = don't assume which account to use
-    if(acct){
-      const r = await msalInstance.acquireTokenSilent({scopes:SCOPES,account:acct});
+    if(accounts.length){
+      try{
+        const r = await msalInstance.acquireTokenSilent({scopes:SCOPES, account:accounts[0]});
+        graphToken = r.accessToken;
+        tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
+        clearTimeout(hardTimeout);
+        await resolveIdentity(accounts[0].username);
+        return;
+      }catch(e){}
+    }
+
+    // 3. Try browser ssoSilent (works if signed into M365 in this browser)
+    try{
+      const r = await msalInstance.ssoSilent({scopes:SCOPES});
       graphToken = r.accessToken;
+      tokenExpiry = r.expiresOn ? r.expiresOn.getTime() : Date.now()+3600000;
       clearTimeout(hardTimeout);
-      await resolveIdentity(acct.username);
+      await resolveIdentity(r.account.username);
       return;
-    }
-  }catch(e){}
-
-  // 2. Try ssoSilent against the browser's live M365 session
-  try{
-    const ssoOpts = {scopes:SCOPES};
-    if(hint) ssoOpts.loginHint = hint;
-    const r = await msalInstance.ssoSilent(ssoOpts);
-    graphToken = r.accessToken;
-    clearTimeout(hardTimeout);
-    await resolveIdentity(r.account.username);
-    return;
-  }catch(e){}
-
-  // All silent paths failed — show the sign-in button
-  showSignIn();
-}
-
-async function resolveIdentity(upn){
-  const email = upn.toLowerCase();
-
-  // Check MGMT list
-  const mgmt = MGMT_LIST.find(m=>m.email.toLowerCase()===email);
-  if(mgmt){
-    SESSION = {name:mgmt.name, email:mgmt.email, role:mgmt.role, zone:mgmt.zone,
-               canSeeAll:mgmt.canSeeAll, isRequester: mgmt.role==='area_manager'||mgmt.role==='approver'&&mgmt.email===APPROVER_EMAILS.emma};
-    // Emma can raise requests
-    if(mgmt.email.toLowerCase()==='emma.mcintyre@completechildcare.co.uk') SESSION.isRequester=true;
-    if(mgmt.role==='area_manager') SESSION.isRequester=true;
-    SESSION.nurseryEntry=null;
-    showApp();
-    return;
+    }catch(e){ console.warn('[STARTUP] Browser ssoSilent failed:', e.message); }
   }
 
-  // Check nursery list
-  const nursery = NURSERY_LIST.find(n=>n.email.toLowerCase()===email);
-  if(nursery){
-    SESSION = {name:nursery.name, email:nursery.email, role:'nursery_manager',
-               zone:nursery.zone, canSeeAll:false, isRequester:true, nurseryEntry:nursery};
-    showApp();
-    return;
-  }
-
-  // Unknown M365 user — treat as requester (can raise requests, sees own only)
-  SESSION = {name:upn, email:upn, role:'requester', zone:'all', canSeeAll:false, isRequester:true, nurseryEntry:null};
-  showApp();
-}
-
-function showApp(){
-  document.getElementById('loading-screen').style.display='none';
-  document.getElementById('auth-screen').style.display='none';
-  document.getElementById('app').style.display='flex';
-
-  document.getElementById('sidebarUser').innerHTML =
-    `<strong>${SESSION.name}</strong>${SESSION.role.replace('_',' ')}`;
-  document.getElementById('signOutBtn').style.display='flex';
-
-  if(SESSION.isRequester) document.getElementById('nav-new').style.display='flex';
-  if(SESSION.canSeeAll||SESSION.role==='area_manager'){
-    document.getElementById('mgmtNavLabel').style.display='block';
-    document.getElementById('nav-all').style.display='flex';
-  }
-
-  navigate('dashboard');
-}
-
-// ═══════════════════════════════════════════════════════════════
-// NAVIGATION
-// ═══════════════════════════════════════════════════════════════
-function navigate(view, requestId){
-  currentView=view;
-  if(requestId) currentRequestId=requestId;
-  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
-  const nb=document.getElementById('nav-'+view);
-  if(nb) nb.classList.add('active');
-  const main=document.getElementById('main');
-  if(view==='dashboard') renderDashboard();
-  else if(view==='new') renderNewForm();
-  else if(view==='all') renderAllRequests();
-  else if(view==='detail') renderDetail(currentRequestId);
-}
-
-// ═══════════════════════════════════════════════════════════════
-// GRAPH API HELPERS
-// ═══════════════════════════════════════════════════════════════
-async function graphGet(path){
-  const r=await fetch(`https://graph.microsoft.com/v1.0${path}`,
-    {headers:{Authorization:`Bearer ${graphToken}`}});
-  if(!r.ok) throw new Error(`Graph GET ${path}: ${r.status}`);
-  return r.json();
-}
-async function graphPost(path,body){
-  const r=await fetch(`https://graph.microsoft.com/v1.0${path}`,
-    {method:'POST',headers:{Authorization:`Bearer ${graphToken}`,'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(!r.ok){const t=await r.text();throw new Error(`Graph POST ${path}: ${r.status} ${t}`);}
-  return r.status===204?null:r.json();
-}
-async function graphPut(path,content){
-  const r=await fetch(`https://graph.microsoft.com/v1.0${path}`,
-    {method:'PUT',headers:{Authorization:`Bearer ${graphToken}`,'Content-Type':'application/json'},body:JSON.stringify(content)});
-  if(!r.ok) throw new Error(`Graph PUT ${path}: ${r.status}`);
-  return r.json();
-}
-
-// ── SharePoint file ops ──────────────────────────────────────
-async function listRequestFiles(){
-  try{
-    const d=await graphGet(`/drives/${DRIVE_ID}/root:/${REQUESTS_FOLDER}:/children?$top=999`);
-    return d.value||[];
-  }catch(e){return [];}
-}
-
-async function readRequest(filename){
-  const d=await graphGet(`/drives/${DRIVE_ID}/root:/${REQUESTS_FOLDER}/${filename}:/content`);
-  return d;
-}
-
-async function writeRequest(filename,data){
-  const content=JSON.stringify(data,null,2);
-  await fetch(`https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/root:/${REQUESTS_FOLDER}/${filename}:/content`,
-    {method:'PUT',headers:{Authorization:`Bearer ${graphToken}`,'Content-Type':'application/json'},body:content});
-}
-
-async function loadAllRequests(){
-  const files=await listRequestFiles();
-  const jsons=files.filter(f=>f.name.endsWith('.json'));
-  const reqs=[];
-  for(const f of jsons){
-    try{
-      const r=await fetch(`https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/root:/${REQUESTS_FOLDER}/${f.name}:/content`,
-        {headers:{Authorization:`Bearer ${graphToken}`}});
-      if(r.ok) reqs.push(await r.json());
-    }catch(e){}
-  }
-  return reqs.sort((a,b)=>new Date(b.submittedAt)-new Date(a.submittedAt));
-}
-
-function filterForUser(reqs){
-  if(SESSION.canSeeAll) return reqs;
-  if(SESSION.role==='area_manager') return reqs.filter(r=>r.zone===SESSION.zone||r.submittedByEmail.toLowerCase()===SESSION.email.toLowerCase());
-  // nursery manager — own only
-  return reqs.filter(r=>r.submittedByEmail.toLowerCase()===SESSION.email.toLowerCase());
-}
-
-// ═══════════════════════════════════════════════════════════════
-// DASHBOARD
-// ═══════════════════════════════════════════════════════════════
-async function renderDashboard(){
-  const main=document.getElementById('main');
-  main.innerHTML=`<div class="page-header"><div><div class="page-title">Dashboard</div><div class="page-sub">Welcome back, ${SESSION.name}</div></div></div>
-  <div style="text-align:center;padding:40px 0"><div class="spinner" style="margin:0 auto"></div></div>`;
-
-  const all=await loadAllRequests();
-  const visible=filterForUser(all);
-  const myPending=visible.filter(r=>isMyTurn(r));
-  const mySubmitted=visible.filter(r=>r.submittedByEmail.toLowerCase()===SESSION.email.toLowerCase());
-
-  let statsHtml=`<div class="stat-row">`;
-  if(SESSION.isRequester) statsHtml+=`<div class="stat-card"><div class="label">My Submissions</div><div class="value">${mySubmitted.length}</div><div class="sub">total raised</div></div>`;
-  if(SESSION.role!=='nursery_manager') statsHtml+=`<div class="stat-card"><div class="label">Awaiting My Approval</div><div class="value">${myPending.length}</div><div class="sub">need action</div></div>`;
-  statsHtml+=`<div class="stat-card"><div class="label">Approved</div><div class="value">${visible.filter(r=>r.status==='APPROVED').length}</div><div class="sub">PO codes issued</div></div>
-  <div class="stat-card"><div class="label">In Progress</div><div class="value">${visible.filter(r=>!['APPROVED','REJECTED'].includes(r.status)).length}</div><div class="sub">in approval chain</div></div>
-  </div>`;
-
-  let pendingTable='';
-  if(myPending.length){
-    pendingTable=`<h3 style="font-size:15px;font-weight:700;color:var(--amber);margin-bottom:12px">Awaiting Your Approval</h3>
-    ${requestTable(myPending)}<br>`;
-  }
-
-  let recentTable='';
-  const recent=visible.slice(0,10);
-  if(recent.length) recentTable=`<h3 style="font-size:15px;font-weight:700;color:var(--teal);margin-bottom:12px">Recent Requests</h3>${requestTable(recent)}`;
-  else recentTable=`<div class="empty"><svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/></svg><p>No requests yet${SESSION.isRequester?' — use the button above to raise one':''}</p></div>`;
-
-  // Hero CTA card for requesters
-  const heroCta = SESSION.isRequester ? `
-  <div onclick="navigate('new')" style="cursor:pointer;background:var(--teal);color:#fff;border-radius:var(--radius);padding:24px 28px;margin-bottom:24px;display:flex;align-items:center;gap:20px;box-shadow:var(--shadow);transition:opacity .15s;" onmouseover="this.style.opacity='.9'" onmouseout="this.style.opacity='1'">
-    <div style="width:52px;height:52px;background:rgba(255,255,255,.2);border-radius:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0">
-      <svg width="26" height="26" fill="none" stroke="#fff" stroke-width="2.2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
-    </div>
-    <div style="flex:1">
-      <div style="font-size:18px;font-weight:700;margin-bottom:4px">Raise a Facilities Request</div>
-      <div style="font-size:13px;opacity:.85">Submit a project request for approval — decorating, flooring, building work, tech, heating and more. Requests over £500 or 5 days labour require approval before a PO code is issued.</div>
-    </div>
-    <svg width="22" height="22" fill="none" stroke="#fff" stroke-width="2.5" viewBox="0 0 24 24" style="flex-shrink:0;opacity:.8"><polyline points="9 18 15 12 9 6"/></svg>
-  </div>` : '';
-
-  main.innerHTML=`<div class="page-header"><div><div class="page-title">Dashboard</div><div class="page-sub">Welcome back, ${SESSION.name}</div></div>
-  ${SESSION.isRequester?'<button class="btn btn-primary" onclick="navigate(\'new\')"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New Request</button>':''}
-  </div>${heroCta}${statsHtml}${pendingTable}${recentTable}`;
-}
-
-function isMyTurn(req){
-  if(req.status==='APPROVED'||req.status==='REJECTED') return false;
-  const e=SESSION.email.toLowerCase();
-  if(req.status==='PENDING_AREA'){
-    const amEmail=(APPROVER_EMAILS['areaManager_'+req.zone]||'').toLowerCase();
-    return e===amEmail;
-  }
-  if(req.status==='PENDING_EMMA') return e===APPROVER_EMAILS.emma.toLowerCase();
-  if(req.status==='PENDING_ALEC') return e===APPROVER_EMAILS.alec.toLowerCase();
-  if(req.status==='PENDING_SIMON') return e===APPROVER_EMAILS.simon.toLowerCase();
-  return false;
-}
-
-function requestTable(reqs){
-  return `<div class="table-wrap"><table>
-  <thead><tr><th>ID</th><th>Nursery</th><th>Title</th><th>Cost</th><th>Labour</th><th>Status</th><th>Submitted</th></tr></thead>
-  <tbody>${reqs.map(r=>`<tr class="row-link" onclick="navigate('detail','${r.id}')">
-    <td><code style="font-size:12px">${r.id}</code></td>
-    <td>${r.nursery}</td>
-    <td>${esc(r.title)}</td>
-    <td>£${Number(r.estimatedCost).toLocaleString()}</td>
-    <td>${r.estimatedLabourDays}d</td>
-    <td><span class="badge ${STATUS_BADGE[r.status]||'badge-pending'}">${STATUS_LABELS[r.status]||r.status}</span></td>
-    <td>${fmtDate(r.submittedAt)}</td>
-  </tr>`).join('')}</tbody></table></div>`;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// ALL REQUESTS VIEW
-// ═══════════════════════════════════════════════════════════════
-async function renderAllRequests(){
-  const main=document.getElementById('main');
-  main.innerHTML=`<div class="page-header"><div><div class="page-title">All Requests</div></div>
-  ${SESSION.isRequester?'<button class="btn btn-primary" onclick="navigate(\'new\')">New Request</button>':''}</div>
-  <div style="text-align:center;padding:40px 0"><div class="spinner" style="margin:0 auto"></div></div>`;
-
-  const all=await loadAllRequests();
-  const visible=filterForUser(all);
-
-  main.innerHTML=`<div class="page-header"><div><div class="page-title">All Requests</div><div class="page-sub">${visible.length} request${visible.length!==1?'s':''}</div></div>
-  ${SESSION.isRequester?'<button class="btn btn-primary" onclick="navigate(\'new\')"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New Request</button>':''}</div>
-  <div class="table-wrap">
-    <div class="table-toolbar">
-      <input type="text" id="filterSearch" placeholder="Search title or nursery..." oninput="filterTable()" style="flex:1;min-width:180px">
-      <select id="filterStatus" onchange="filterTable()">
-        <option value="">All statuses</option>
-        ${Object.entries(STATUS_LABELS).map(([k,v])=>`<option value="${k}">${v}</option>`).join('')}
-      </select>
-      <select id="filterZone" onchange="filterTable()" ${SESSION.role==='area_manager'?'style="display:none"':''}>
-        <option value="">All zones</option>
-        <option value="BlueWater">BlueWater</option>
-        <option value="Greenwood">Greenwood</option>
-        <option value="HQ">HQ</option>
-      </select>
-    </div>
-    <table id="allTable">
-      <thead><tr><th>ID</th><th>Nursery</th><th>Title</th><th>Cost</th><th>Labour</th><th>Priority</th><th>Status</th><th>Submitted</th></tr></thead>
-      <tbody id="allTbody">${visible.map(r=>allRow(r)).join('')}</tbody>
-    </table>
-    ${visible.length===0?'<div class="empty"><p>No requests found.</p></div>':''}
-  </div>`;
-
-  window._allReqs=visible;
-}
-
-function allRow(r){
-  return `<tr class="row-link" onclick="navigate('detail','${r.id}')" data-nursery="${esc(r.nursery)}" data-title="${esc(r.title)}" data-status="${r.status}" data-zone="${r.zone||''}">
-    <td><code style="font-size:12px">${r.id}</code></td>
-    <td>${esc(r.nursery)}</td>
-    <td>${esc(r.title)}</td>
-    <td>£${Number(r.estimatedCost).toLocaleString()}</td>
-    <td>${r.estimatedLabourDays}d</td>
-    <td>${r.priority}</td>
-    <td><span class="badge ${STATUS_BADGE[r.status]||'badge-pending'}">${STATUS_LABELS[r.status]||r.status}</span></td>
-    <td>${fmtDate(r.submittedAt)}</td>
-  </tr>`;
-}
-
-function filterTable(){
-  const q=(document.getElementById('filterSearch').value||'').toLowerCase();
-  const st=document.getElementById('filterStatus').value;
-  const zn=document.getElementById('filterZone')?.value||'';
-  document.querySelectorAll('#allTbody tr').forEach(tr=>{
-    const nursery=(tr.dataset.nursery||'').toLowerCase();
-    const title=(tr.dataset.title||'').toLowerCase();
-    const status=tr.dataset.status||'';
-    const zone=tr.dataset.zone||'';
-    const matchQ=!q||(nursery.includes(q)||title.includes(q));
-    const matchS=!st||status===st;
-    const matchZ=!zn||zone===zn;
-    tr.style.display=(matchQ&&matchS&&matchZ)?'':'none';
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════
-// NEW REQUEST FORM
-// ═══════════════════════════════════════════════════════════════
-function renderNewForm(){
-  const main=document.getElementById('main');
-
-  // Determine which nurseries to show
-  let nurseries;
-  if(SESSION.role==='nursery_manager' && SESSION.nurseryEntry){
-    nurseries=[SESSION.nurseryEntry];
-  } else if(SESSION.role==='area_manager'){
-    nurseries=NURSERY_LIST.filter(n=>n.zone===SESSION.zone);
-  } else {
-    nurseries=NURSERY_LIST;
-  }
-
-  main.innerHTML=`
-  <div class="page-header">
-    <div><div class="page-title">New Facilities Request</div><div class="page-sub">Requests over £500 or 5 working days require approval</div></div>
-    <button class="btn btn-ghost" onclick="navigate('dashboard')">Cancel</button>
-  </div>
-  <div class="threshold-warn" id="thresholdWarn">
-    ⚠️ This request is below the approval threshold (under £500 and under 5 working days). Please use the minor works process or petty cash instead.
-  </div>
-  <div class="form-card">
-    <div class="form-grid">
-      <div class="form-group full">
-        <label>Nursery <span class="req">*</span></label>
-        <select id="f_nursery" ${nurseries.length===1?'disabled':''}>
-          ${nurseries.map(n=>`<option value="${n.name}" data-code="${n.code}" data-zone="${n.zone}">${n.name}</option>`).join('')}
-        </select>
-      </div>
-      <div class="form-group full">
-        <label>Request Title <span class="req">*</span></label>
-        <input type="text" id="f_title" maxlength="100" placeholder="Brief description of the work required" oninput="document.getElementById('titleCount').textContent=this.value.length+'/100'">
-        <span class="char-hint" id="titleCount">0/100</span>
-      </div>
-      <div class="form-group full">
-        <label>Full Description <span class="req">*</span></label>
-        <textarea id="f_desc" rows="4" placeholder="Describe the work in full, including any urgency or safety concerns"></textarea>
-      </div>
-      <div class="form-group">
-        <label>Job Type <span class="req">*</span></label>
-        <select id="f_jobtype">
-          ${RESOURCE_CODES.map(r=>`<option value="${r.code}">${r.label}</option>`).join('')}
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Priority <span class="req">*</span></label>
-        <select id="f_priority">
-          ${Object.entries(PRIORITY_LABELS).map(([k,v])=>`<option value="${k}">${v}</option>`).join('')}
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Location <span class="req">*</span></label>
-        <div class="radio-row">
-          <label><input type="radio" name="location" value="I" checked> Interior</label>
-          <label><input type="radio" name="location" value="E"> Exterior</label>
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Estimated Cost (£) <span class="req">*</span></label>
-        <input type="number" id="f_cost" min="0" step="1" placeholder="0" oninput="checkThreshold()">
-      </div>
-      <div class="form-group">
-        <label>Estimated Labour (working days) <span class="req">*</span></label>
-        <input type="number" id="f_labour" min="0" step="0.5" placeholder="0" oninput="checkThreshold()">
-      </div>
-      <div class="form-group full">
-        <label>Supporting Documents</label>
-        <input type="file" id="f_files" multiple accept="image/*,.pdf,.doc,.docx,.xls,.xlsx">
-        <span class="char-hint">Photos, quotes, drawings — any format accepted</span>
-      </div>
-    </div>
-    <div class="form-actions">
-      <button class="btn btn-primary" id="submitBtn" onclick="submitRequest()">
-        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-        Submit Request
-      </button>
-      <button class="btn btn-ghost" onclick="navigate('dashboard')">Cancel</button>
-    </div>
-  </div>`;
-
-  if(nurseries.length===1) document.getElementById('f_nursery').value=nurseries[0].name;
-}
-
-function checkThreshold(){
-  const cost=parseFloat(document.getElementById('f_cost').value)||0;
-  const labour=parseFloat(document.getElementById('f_labour').value)||0;
-  const warn=document.getElementById('thresholdWarn');
-  const btn=document.getElementById('submitBtn');
-  if(cost>0||labour>0){
-    const belowThreshold=cost<=500&&labour<=5;
-    warn.classList.toggle('show',belowThreshold);
-    btn.disabled=belowThreshold;
-  }
-}
-
-async function submitRequest(){
-  const nurseryEl=document.getElementById('f_nursery');
-  const nurseryName=nurseryEl.value;
-  const nurseryOpt=nurseryEl.options[nurseryEl.selectedIndex];
-  const nurseryCode=nurseryOpt.dataset.code;
-  const zone=nurseryOpt.dataset.zone;
-  const title=document.getElementById('f_title').value.trim();
-  const desc=document.getElementById('f_desc').value.trim();
-  const jobTypeCode=document.getElementById('f_jobtype').value;
-  const jobTypeLabel=RESOURCE_CODES.find(r=>r.code===jobTypeCode)?.label||jobTypeCode;
-  const priority=document.getElementById('f_priority').value;
-  const location=document.querySelector('input[name="location"]:checked').value;
-  const cost=parseFloat(document.getElementById('f_cost').value)||0;
-  const labour=parseFloat(document.getElementById('f_labour').value)||0;
-
-  if(!title||!desc){showToast('Please fill in all required fields','error');return;}
-  if(cost<=500&&labour<=5){showToast('Request is below the approval threshold','error');return;}
-
-  const btn=document.getElementById('submitBtn');
-  btn.disabled=true;btn.textContent='Submitting...';
-
-  const id='FR-'+Date.now();
-  const now=new Date().toISOString();
-
-  // Determine first approver
-  let firstStatus='PENDING_AREA';
-  let firstApproverEmail=APPROVER_EMAILS['areaManager_'+zone]||APPROVER_EMAILS.emma;
-  if(zone==='HQ'){firstStatus='PENDING_EMMA';firstApproverEmail=APPROVER_EMAILS.emma;}
-
-  const req={
-    id,nursery:nurseryName,nurseryCode,zone,
-    submittedBy:SESSION.name,submittedByEmail:SESSION.email,
-    submittedAt:now,updatedAt:now,
-    title,description:desc,
-    jobType:jobTypeLabel,jobTypeCode,
-    location,priority:parseInt(priority),
-    estimatedCost:cost,estimatedLabourDays:labour,
-    status:firstStatus,
-    attachments:[],
-    approvals:{
-      areaManager:{approverName:'',approverEmail:'',decision:'pending',comment:'',timestamp:''},
-      emma:{approverName:'',approverEmail:'',decision:'pending',comment:'',timestamp:''},
-      alec:{approverName:'',approverEmail:'',decision:'pending',comment:'',timestamp:''},
-      simon:{approverName:'',approverEmail:'',decision:'pending',comment:'',timestamp:''},
-    },
-    poCode:null,
-    rejectionReason:null,
-  };
-
-  // Upload attachments
-  const files=document.getElementById('f_files').files;
-  for(const file of files){
-    try{
-      const ab=await file.arrayBuffer();
-      const r=await fetch(`https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/root:/${ATTACHMENTS_FOLDER}/${id}/${file.name}:/content`,
-        {method:'PUT',headers:{Authorization:`Bearer ${graphToken}`,'Content-Type':file.type||'application/octet-stream'},body:ab});
-      if(r.ok){
-        const d=await r.json();
-        req.attachments.push({name:file.name,url:d.webUrl});
-      }
-    }catch(e){}
-  }
-
-  await writeRequest(id+'.json',req);
-
-  // Notify first approver
-  await sendEmail(firstApproverEmail,
-    `[Action Required] Facilities request: ${title} — ${nurseryName}`,
-    emailBody(req,'approval',firstApproverEmail));
-
-  showToast('Request submitted successfully','success');
-  navigate('dashboard');
-}
-
-// ═══════════════════════════════════════════════════════════════
-// DETAIL VIEW
-// ═══════════════════════════════════════════════════════════════
-async function renderDetail(id){
-  const main=document.getElementById('main');
-  main.innerHTML=`<div style="text-align:center;padding:60px 0"><div class="spinner" style="margin:0 auto"></div></div>`;
-
-  // Load all requests and find by id
-  const all=await loadAllRequests();
-  const req=all.find(r=>r.id===id);
-  if(!req){main.innerHTML='<div class="empty"><p>Request not found.</p></div>';return;}
-
-  const myTurn=isMyTurn(req);
-  const canApprove=myTurn&&!['APPROVED','REJECTED'].includes(req.status);
-
-  const steps=[
-    {key:'areaManager',label:req.zone==='HQ'?'Skipped (HQ request)':'Area Manager',
-     email:APPROVER_EMAILS['areaManager_'+req.zone]||''},
-    {key:'emma',label:'Emma McIntyre',email:APPROVER_EMAILS.emma},
-    {key:'alec',label:'Alec Hodson',email:APPROVER_EMAILS.alec},
-    {key:'simon',label:'Simon Hasler',email:APPROVER_EMAILS.simon},
-  ];
-
-  const statusOrder=['PENDING_AREA','PENDING_EMMA','PENDING_ALEC','PENDING_SIMON'];
-  const currentIdx=statusOrder.indexOf(req.status);
-
-  function stepDotClass(i,key){
-    const a=req.approvals[key];
-    if(a.decision==='approved') return 'approved';
-    if(a.decision==='rejected') return 'rejected';
-    if(req.status!=='APPROVED'&&req.status!=='REJECTED'&&i===currentIdx) return 'current';
-    return '';
-  }
-
-  function stepIcon(cls){
-    if(cls==='approved') return '✓';
-    if(cls==='rejected') return '✗';
-    if(cls==='current') return '→';
-    return '○';
-  }
-
-  const chainHtml=steps.map((s,i)=>{
-    const cls=stepDotClass(i,s.key);
-    const a=req.approvals[s.key];
-    return `<div class="approval-step">
-      <div class="step-dot ${cls}">${stepIcon(cls)}</div>
-      <div class="step-body">
-        <div class="step-name">${s.label}</div>
-        <div class="step-meta">${a.decision==='pending'?(cls==='current'?'Awaiting decision':'Not yet reached'):(a.approverName+' — '+fmtDate(a.timestamp))}</div>
-        ${a.comment?`<div class="step-comment" style="${a.decision==='rejected'?'background:var(--red-light);color:var(--red)':'background:var(--green-light);color:var(--green)'}">
-          <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;opacity:.8">${a.decision==='rejected'?'Rejection reason':'Justification'}</span><br>
-          ${esc(a.comment)}
-        </div>`:''}
-      </div>
-    </div>`;
-  }).join('');
-
-  const poHtml=req.poCode?`<div class="po-box"><div class="po-label">Purchase Order Code</div><div class="po-code">${req.poCode}</div></div>`:'';
-
-  const attachHtml=req.attachments.length?`<div class="detail-card" style="margin-top:16px"><h3>Attachments</h3>
-    ${req.attachments.map(a=>`<div style="margin-bottom:8px"><a href="${a.url}" target="_blank">📎 ${esc(a.name)}</a></div>`).join('')}</div>`:'';
-
-  const actionPanel=canApprove?`<div class="action-panel">
-    <h3>Your Decision Required</h3>
-    <p style="font-size:13px;color:var(--grey);margin-bottom:14px">Review the full request details before deciding. Your justification is recorded against the approval chain and visible to all approvers.</p>
-    <label style="margin-bottom:6px;display:block;font-size:12.5px;font-weight:700">
-      Justification <span style="color:var(--red)">*</span>
-      <span style="color:var(--grey);font-weight:400;font-size:11px"> — required for both approval and rejection</span>
-    </label>
-    <textarea id="approvalComment" rows="4" placeholder="Explain your decision — e.g. approved as H&S priority confirmed, or rejected as quote required before proceeding..." oninput="document.getElementById('approvalCharCount').textContent=this.value.length+' chars'"></textarea>
-    <div style="font-size:11px;color:var(--grey);margin-bottom:14px;text-align:right" id="approvalCharCount">0 chars</div>
-    <div class="action-btns">
-      <button class="btn btn-success" onclick="doApprove('${id}')">
-        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-        Approve
-      </button>
-      <button class="btn btn-danger" onclick="doReject('${id}')">
-        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        Reject
-      </button>
-    </div>
-  </div>`:'';
-
-  main.innerHTML=`
-  <div class="page-header">
-    <div>
-      <div class="page-title">${esc(req.title)}</div>
-      <div class="page-sub">${req.nursery} &middot; Submitted by ${esc(req.submittedBy)} on ${fmtDate(req.submittedAt)}</div>
-    </div>
-    <div style="display:flex;gap:10px;align-items:center">
-      <span class="badge ${STATUS_BADGE[req.status]||'badge-pending'}">${STATUS_LABELS[req.status]||req.status}</span>
-      <button class="btn btn-ghost btn-sm" onclick="history.back?navigate('dashboard'):navigate('dashboard')">← Back</button>
-    </div>
-  </div>
-  <div class="detail-grid">
-    <div>
-      <div class="detail-card">
-        <h3>Request Details</h3>
-        <div class="form-grid" style="gap:12px">
-          <div class="detail-field"><div class="lbl">Reference</div><div class="val"><code>${req.id}</code></div></div>
-          <div class="detail-field"><div class="lbl">Nursery</div><div class="val">${esc(req.nursery)}</div></div>
-          <div class="detail-field"><div class="lbl">Job Type</div><div class="val">${esc(req.jobType)}</div></div>
-          <div class="detail-field"><div class="lbl">Location</div><div class="val">${req.location==='I'?'Interior':'Exterior'}</div></div>
-          <div class="detail-field"><div class="lbl">Priority</div><div class="val">${PRIORITY_LABELS[req.priority]||req.priority}</div></div>
-          <div class="detail-field"><div class="lbl">Estimated Cost</div><div class="val">£${Number(req.estimatedCost).toLocaleString()}</div></div>
-          <div class="detail-field"><div class="lbl">Estimated Labour</div><div class="val">${req.estimatedLabourDays} working days</div></div>
-          <div class="detail-field full"><div class="lbl">Description</div><div class="val" style="white-space:pre-wrap">${esc(req.description)}</div></div>
-          ${req.rejectionReason?`<div class="detail-field full"><div class="lbl" style="color:var(--red)">Rejection Reason</div><div class="val">${esc(req.rejectionReason)}</div></div>`:''}
-        </div>
-      </div>
-      ${attachHtml}
-    </div>
-    <div>
-      ${poHtml}
-      ${actionPanel}
-      <div class="detail-card" style="margin-top:${actionPanel||poHtml?'16px':'0'}">
-        <h3>Approval Chain</h3>
-        <div class="approval-chain">${chainHtml}</div>
-      </div>
-    </div>
-  </div>`;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// APPROVE / REJECT
-// ═══════════════════════════════════════════════════════════════
-async function doApprove(id){
-  const comment=document.getElementById('approvalComment').value.trim();
-  if(!comment){showToast('Please add a justification before approving','error');return;}
-  await processDecision(id,'approved',comment);
-}
-
-async function doReject(id){
-  const comment=document.getElementById('approvalComment').value.trim();
-  if(!comment){showToast('Please add a justification before rejecting','error');return;}
-  await processDecision(id,'rejected',comment);
-}
-
-async function processDecision(id,decision,comment){
-  const all=await loadAllRequests();
-  const req=all.find(r=>r.id===id);
-  if(!req){showToast('Request not found','error');return;}
-
-  const now=new Date().toISOString();
-  const stageMap={PENDING_AREA:'areaManager',PENDING_EMMA:'emma',PENDING_ALEC:'alec',PENDING_SIMON:'simon'};
-  const stage=stageMap[req.status];
-  if(!stage){showToast('Nothing to approve at this stage','error');return;}
-
-  req.approvals[stage]={approverName:SESSION.name,approverEmail:SESSION.email,decision,comment,timestamp:now};
-  req.updatedAt=now;
-
-  if(decision==='rejected'){
-    req.status='REJECTED';
-    req.rejectionReason=comment;
-    await writeRequest(id+'.json',req);
-    await sendEmail(req.submittedByEmail,
-      `[Rejected] Facilities request: ${req.title} — ${req.nursery}`,
-      emailBody(req,'rejected',req.submittedByEmail));
-    showToast('Request rejected','success');
-    navigate('dashboard');
-    return;
-  }
-
-  // Advance to next stage
-  const nextStage={
-    PENDING_AREA:'PENDING_EMMA',
-    PENDING_EMMA:'PENDING_ALEC',
-    PENDING_ALEC:'PENDING_SIMON',
-    PENDING_SIMON:'APPROVED',
-  };
-  req.status=nextStage[req.status]||'APPROVED';
-
-  if(req.status==='APPROVED'){
-    req.poCode=generatePOCode(req);
-    await writeRequest(id+'.json',req);
-    // Notify requester + all approvers
-    const allEmails=[req.submittedByEmail,APPROVER_EMAILS.emma,APPROVER_EMAILS.alec,APPROVER_EMAILS.simon];
-    const amEmail=APPROVER_EMAILS['areaManager_'+req.zone];
-    if(amEmail) allEmails.push(amEmail);
-    for(const email of [...new Set(allEmails)]){
-      await sendEmail(email,`[Approved] Facilities PO issued: ${req.poCode} — ${req.title}`,emailBody(req,'approved_final',email));
-    }
-    showToast('Approved! PO code: '+req.poCode,'success');
-  } else {
-    const nextEmail={PENDING_EMMA:APPROVER_EMAILS.emma,PENDING_ALEC:APPROVER_EMAILS.alec,PENDING_SIMON:APPROVER_EMAILS.simon}[req.status];
-    await writeRequest(id+'.json',req);
-    await sendEmail(nextEmail,`[Action Required] Facilities request: ${req.title} — ${req.nursery}`,emailBody(req,'approval',nextEmail));
-    showToast('Approved and passed to next approver','success');
-  }
-
-  navigate('dashboard');
-}
-
-// ═══════════════════════════════════════════════════════════════
-// PO CODE GENERATOR
-// ═══════════════════════════════════════════════════════════════
-function generatePOCode(req){
-  return `${req.nurseryCode}-${req.location}${req.jobTypeCode}-${req.priority}`;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// EMAIL
-// ═══════════════════════════════════════════════════════════════
-async function sendEmail(to,subject,body){
-  try{
-    await graphPost('/users/'+MAIL_SENDER+'/sendMail',{
-      message:{
-        subject,
-        body:{contentType:'HTML',content:body},
-        toRecipients:[{emailAddress:{address:to}}],
-      },
-      saveToSentItems:false,
-    });
-  }catch(e){console.warn('Email failed:',e);}
-}
-
-function emailBody(req,type,recipientEmail){
-  const appUrl=`https://alechodson.github.io/facilities-companion/`;
-  const baseStyle=`font-family:Segoe UI,sans-serif;color:#111;font-size:14px;line-height:1.6;`;
-  const headerColor='#006B6B';
-
-  let headline='',detail='';
-  if(type==='approval'){
-    headline=`A facilities project request requires your approval.`;
-    detail=`Please review and approve or reject via the link below.`;
-  } else if(type==='rejected'){
-    headline=`Your facilities request has been rejected.`;
-    detail=`Reason: <em>${esc(req.rejectionReason||'No reason given')}</em>`;
-  } else if(type==='approved_final'){
-    headline=`Facilities request approved — PO code issued.`;
-    detail=`<strong style="font-size:20px;color:${headerColor}">${req.poCode}</strong><br>Please quote this code on all orders and invoices.`;
-  }
-
-  return `<div style="${baseStyle}max-width:600px;margin:0 auto">
-    <div style="background:${headerColor};color:#fff;padding:20px 28px;border-radius:10px 10px 0 0">
-      <div style="font-size:18px;font-weight:700">Facilities Companion</div>
-      <div style="font-size:12px;opacity:.8">Complete Childcare Group</div>
-    </div>
-    <div style="background:#fff;padding:24px 28px;border:1px solid #e5e7eb;border-top:none">
-      <p style="font-size:16px;font-weight:600;margin-bottom:8px">${headline}</p>
-      <p style="margin-bottom:20px">${detail}</p>
-      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:20px">
-        <tr><td style="padding:7px 12px;background:#f3f4f6;font-weight:600;width:140px">Reference</td><td style="padding:7px 12px;border-bottom:1px solid #e5e7eb">${req.id}</td></tr>
-        <tr><td style="padding:7px 12px;background:#f3f4f6;font-weight:600">Nursery</td><td style="padding:7px 12px;border-bottom:1px solid #e5e7eb">${esc(req.nursery)}</td></tr>
-        <tr><td style="padding:7px 12px;background:#f3f4f6;font-weight:600">Title</td><td style="padding:7px 12px;border-bottom:1px solid #e5e7eb">${esc(req.title)}</td></tr>
-        <tr><td style="padding:7px 12px;background:#f3f4f6;font-weight:600">Job Type</td><td style="padding:7px 12px;border-bottom:1px solid #e5e7eb">${esc(req.jobType)}</td></tr>
-        <tr><td style="padding:7px 12px;background:#f3f4f6;font-weight:600">Cost</td><td style="padding:7px 12px;border-bottom:1px solid #e5e7eb">£${Number(req.estimatedCost).toLocaleString()}</td></tr>
-        <tr><td style="padding:7px 12px;background:#f3f4f6;font-weight:600">Labour</td><td style="padding:7px 12px;border-bottom:1px solid #e5e7eb">${req.estimatedLabourDays} working days</td></tr>
-        <tr><td style="padding:7px 12px;background:#f3f4f6;font-weight:600">Priority</td><td style="padding:7px 12px">${PRIORITY_LABELS[req.priority]||req.priority}</td></tr>
-      </table>
-      <a href="${appUrl}" style="display:inline-block;background:${headerColor};color:#fff;padding:11px 22px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px">Open in Facilities Companion →</a>
-    </div>
-    <div style="padding:14px 28px;font-size:11px;color:#9ca3af">This is an automated notification from Facilities Companion. Do not reply to this email.</div>
-  </div>`;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// UTILITIES
-// ═══════════════════════════════════════════════════════════════
-function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-function fmtDate(iso){if(!iso)return'—';const d=new Date(iso);return d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'});}
-
-let toastTimer;
-function showToast(msg,type=''){
-  const t=document.getElementById('toast');
-  t.textContent=msg;t.className='toast '+(type||'');
-  t.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer=setTimeout(()=>t.classList.remove('show'),3800);
-}
-
-// ═══════════════════════════════════════════════════════════════
-// BOOT
-// ═══════════════════════════════════════════════════════════════
-boot().catch(e=>{
+  // 4. Nothing worked — show sign-in screen
+  clearTimeout(hardTimeout);
   document.getElementById('loading-screen').style.display='none';
   document.getElementById('auth-screen').style.display='flex';
-  console.error('Boot error:',e);
-});
+})();
 </script>
 </body>
 </html>
