@@ -1267,19 +1267,37 @@
         async function doSignIn() {
             try {
                 const response = await msalInstance.loginPopup({
-                    scopes: graphScopes
+                    scopes: graphScopes,
+                    redirectUri: window.location.origin + window.location.pathname
                 });
-                await resolveIdentity(response.account.username);
+                if (response && response.account) {
+                    await resolveIdentity(response.account.username);
+                }
             } catch (error) {
                 console.error('Sign-in error:', error);
+                alert('Sign-in failed. Please try again or use the identity picker.');
             }
         }
 
         async function resolveIdentity(upn) {
             try {
+                // Ensure we have a valid account
+                let account = msalInstance.getAccountByUsername(upn);
+                if (!account) {
+                    // Try to find account by email pattern
+                    const accounts = msalInstance.getAllAccounts();
+                    account = accounts.find(a => a.username.toLowerCase() === upn.toLowerCase()) || accounts[0];
+                }
+
+                if (!account) {
+                    console.error('No account found for:', upn);
+                    showSignInScreen();
+                    return;
+                }
+
                 const request = {
                     scopes: ['User.Read'],
-                    account: msalInstance.getAccountByUsername(upn)
+                    account: account
                 };
                 const tokenResponse = await msalInstance.acquireTokenSilent(request);
 
