@@ -1178,21 +1178,41 @@
             try {
                 await msalInstance.initialize();
 
+                // Check if already signed in (from previous session)
+                const accounts = msalInstance.getAllAccounts();
+                if (accounts.length > 0) {
+                    console.log('Previous session found, attempting to restore...');
+                    await resolveIdentity(accounts[0].username);
+                    return;
+                }
+
                 // Try Teams auto sign-in
                 const teamsInitialized = await teamsInitializeWithTimeout();
 
                 if (teamsInitialized) {
-                    const teamsContext = await new Promise((resolve) => {
-                        microsoftTeams.app.getContext().then(resolve);
-                    });
-                    if (teamsContext && teamsContext.user && teamsContext.user.loginHint) {
-                        const matchingUser = Object.keys(STAFF_DIRECTORY).find(email => 
-                            email.toLowerCase().includes(teamsContext.user.loginHint.toLowerCase())
-                        );
-                        if (matchingUser) {
-                            await doSilentSignIn(matchingUser);
-                            return;
+                    try {
+                        const teamsContext = await new Promise((resolve, reject) => {
+                            const timeout = setTimeout(() => reject('timeout'), 5000);
+                            microsoftTeams.app.getContext().then(ctx => {
+                                clearTimeout(timeout);
+                                resolve(ctx);
+                            }).catch(err => {
+                                clearTimeout(timeout);
+                                reject(err);
+                            });
+                        });
+
+                        if (teamsContext && teamsContext.user && teamsContext.user.loginHint) {
+                            const matchingUser = Object.keys(STAFF_DIRECTORY).find(email => 
+                                email.toLowerCase().includes(teamsContext.user.loginHint.toLowerCase())
+                            );
+                            if (matchingUser) {
+                                await doSilentSignIn(matchingUser);
+                                return;
+                            }
                         }
+                    } catch (teamsError) {
+                        console.log('Teams context not available:', teamsError);
                     }
                 }
 
@@ -1240,26 +1260,35 @@
             try {
                 const accounts = msalInstance.getAllAccounts();
                 if (accounts.length > 0) {
+                    console.log('Found cached account, attempting silent token...');
                     const request = {
                         scopes: graphScopes,
                         account: accounts[0]
                     };
-                    const response = await msalInstance.acquireTokenSilent(request);
-                    await resolveIdentity(accounts[0].username);
-                } else {
-                    // Try ssoSilent with no hint
-                    const request = {
-                        scopes: graphScopes
-                    };
-                    const response = await msalInstance.ssoSilent(request);
-                    if (response && response.account) {
-                        await resolveIdentity(response.account.username);
-                    } else {
-                        showSignInScreen();
+                    try {
+                        const response = await msalInstance.acquireTokenSilent(request);
+                        await resolveIdentity(accounts[0].username);
+                        return;
+                    } catch (tokenError) {
+                        console.log('Silent token failed, trying ssoSilent...');
                     }
                 }
+
+                // Try ssoSilent with no hint (browser SSO)
+                console.log('Attempting browser SSO (ssoSilent)...');
+                const ssoRequest = {
+                    scopes: graphScopes
+                };
+                const response = await msalInstance.ssoSilent(ssoRequest);
+                if (response && response.account) {
+                    console.log('Browser SSO successful');
+                    await resolveIdentity(response.account.username);
+                } else {
+                    console.log('Browser SSO returned no account');
+                    showSignInScreen();
+                }
             } catch (error) {
-                console.log('Browser SSO not available, showing sign-in screen');
+                console.log('Browser SSO not available:', error.message);
                 showSignInScreen();
             }
         }
